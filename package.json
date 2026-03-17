@@ -71,5 +71,8 @@
     "postcss": "^8.5",
     "tailwindcss": "^3.4.17",
     "typescript": "^5"
+  },
+  "resolutions": {
+    "vaul": "1.0.0"
   }
 }
