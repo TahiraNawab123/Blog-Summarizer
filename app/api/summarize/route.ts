@@ -2,6 +2,7 @@ import { type NextRequest, NextResponse } from "next/server"
 import { generateText } from "ai"
 import { openai } from "@ai-sdk/openai"
 import * as cheerio from "cheerio"
+import puppeteer from "puppeteer"
 
 interface ArticleContent {
   title: string
@@ -41,6 +42,84 @@ function calculateTextDensity(element: ReturnType<typeof $>, $: cheerio.CheerioA
   return textLength * (1 - Math.min(linkDensity, 0.5))
 }
 
+function detectJavaScriptRenderedContent(html: string, $: cheerio.CheerioAPI): boolean {
+  // Check for empty content containers that are populated by JS
+  const emptyContentDivs = [
+    '#post-body:empty',
+    '[id*="content"]:empty',
+    '[class*="article-content"]:empty',
+    '[class*="post-body"]:empty',
+  ]
+  
+  for (const selector of emptyContentDivs) {
+    if ($(selector).length > 0) {
+      return true
+    }
+  }
+  
+  // Check if the main article is hidden (display: none)
+  const hiddenArticles = $('article[style*="display: none"], [role="article"][style*="display: none"]')
+  if (hiddenArticles.length > 0 && $(hiddenArticles).find('[id*="body"], [class*="content"]').length === 0) {
+    return true
+  }
+  
+  return false
+}
+
+async function renderWithPuppeteer(url: string): Promise<string> {
+  let browser
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
+    })
+    
+    const page = await browser.newPage()
+    page.setDefaultNavigationTimeout(15000)
+    page.setDefaultTimeout(15000)
+    
+    // Set User-Agent
+    await page.setUserAgent(
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    )
+    
+    // Extract slug from URL path for sites that use query parameters
+    let navigateUrl = url
+    const urlObj = new URL(url)
+    const pathParts = urlObj.pathname.split('/').filter(p => p.length > 0)
+    const lastPart = pathParts[pathParts.length - 1]
+    
+    // If URL has a slug-like path, add it as a query parameter for compatibility
+    if (lastPart && !lastPart.includes('.')) {
+      const separator = navigateUrl.includes('?') ? '&' : '?'
+      navigateUrl = `${navigateUrl}${separator}slug=${encodeURIComponent(lastPart)}`
+    }
+    
+    // Navigate to page
+    await page.goto(navigateUrl, { waitUntil: 'networkidle2' })
+    
+    // Wait for content to load
+    await new Promise(resolve => setTimeout(resolve, 3000))
+    
+    // Get the rendered HTML
+    const html = await page.content()
+    
+    await page.close()
+    return html
+  } catch (error) {
+    throw new Error(`Failed to render JavaScript content: ${error instanceof Error ? error.message : 'Unknown error'}`)
+  } finally {
+    if (browser) {
+      await browser.close()
+    }
+  }
+}
+
 async function extractArticleContent(url: string): Promise<ArticleContent> {
   try {
     const response = await fetch(url, {
@@ -61,9 +140,21 @@ async function extractArticleContent(url: string): Promise<ArticleContent> {
       throw new Error(`HTTP error! status: ${response.status}`)
     }
 
-    const finalUrl = response.url
-    const html = await response.text()
-    const $ = cheerio.load(html)
+    let finalUrl = response.url
+    let html = await response.text()
+    let $ = cheerio.load(html)
+    
+    // Check if content is rendered by JavaScript
+    if (detectJavaScriptRenderedContent(html, $)) {
+      console.log("[v0] Detected JavaScript-rendered content, using Puppeteer...")
+      try {
+        html = await renderWithPuppeteer(url)
+        $ = cheerio.load(html) // Reload cheerio with rendered HTML
+      } catch (jsError) {
+        console.error("[v0] Puppeteer rendering failed, continuing with static HTML:", jsError)
+        // Continue with static HTML if Puppeteer fails
+      }
+    }
 
     $("script, style, noscript, iframe, embed, object, svg, canvas, video, audio, picture, source, track, map, area, form, input, textarea, button, select, optgroup, option, label, fieldset, legend, dialog, details, summary, menu, menuitem, template, slot, shadow, comment, .advertisement, .ad, .ads, .social-share, .share-buttons, .comments, .comment-section, .related-posts, .recommended, .sidebar, .widget, .popup, .modal, .overlay, .cookie-notice, .newsletter, .subscribe, .subscription, [role='complementary'], [role='navigation'], nav, header, footer, aside, .nav, .navigation, .menu, .footer, .header, .copyright, .credits, .author-bio, .bio, .promo, .promotion, .cta, .call-to-action").remove()
 
